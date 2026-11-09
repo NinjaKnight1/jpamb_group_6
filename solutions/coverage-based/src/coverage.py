@@ -388,6 +388,22 @@ def fuzz_input(rand: random.Random, methodid: jvm.AbsMethodID) -> jpamb.case.Inp
 
     return jpamb.case.Input(input)
 
+## TODO 
+class Corpus:
+  parameters: jpamb.Parameters
+  interesting: list[bytes]
+  coverage: set[jvmc.PC]
+ 
+  def byte_fuzz(self, code: bytes) -> jpamb.case.Input:
+      """Using an sequence of bytes, create a new input which matches 
+      the parameters"""
+
+  def next(self) -> jpamb.case.Input:
+      """Randomly pick an intersting case, and mutate by making changes to the bytes"""
+
+  def add(self, input: jpamb.case.Input, coverage: set[jvmc.PC]):
+      """Add the input to the interesting cases if increases coverage"""
+
 
 def analyse():
     """The dynamic analysis, e.g. in this case a (dumb) fuzzer."""
