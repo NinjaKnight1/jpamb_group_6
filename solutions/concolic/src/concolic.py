@@ -4,6 +4,7 @@ import sys
 import jpamb
 import jvm
 import jvm.state as jvmc
+import z3
 
 def binary(op, v1: int, v2: int) -> int | str:
     match op:
@@ -347,7 +348,7 @@ def initial(bc: jpamb.Bytecode, methodid: jvm.AbsMethodID, input: jpamb.Input):
 
 
 def interpret():
-    """The entry point for the interpreter"""
+    """The concolic intepreter.b"""
 
     methodid, input, max_steps = jpamb.getcase(
         "coverage",
@@ -388,9 +389,42 @@ def fuzz_input(rand: random.Random, methodid: jvm.AbsMethodID) -> jpamb.case.Inp
 
     return jpamb.case.Input(input)
 
+def concolicAnalyse(pc : jvmc.PC, inputs : list[tuple[str, jvm.Type]], max_depth : int):
+  # assuming only integers, create symbolic vars for all input
+  locals = z3.Ints(" ".join(i_name for i_name, _ in inputs))
+  # create state.
+  state = SymState.from_locals(locals)
+
+  # Create a stack to do depth first search with.
+  stack : list[tuple[jvmc.PC, SymState, SymPath, int]] = [(pc, state, [],0)]
+
+  # As long as the stack is not empty
+  while stack:
+    # pop the end of the stack
+    (pc, state, path, n) = stack.pop(-1)
+
+    # Check if state does something we want to warn the user about.
+    if interesting(state):
+      return "found interesting state"
+
+    # otherwise create the list of next branches 
+    for (pc, state_, pathc) in step(pc, state):
+        # add new path constraints to the path
+        path_ = path + pathc
+
+        # check if path is reachable
+        if str(z3.check(path_)) != "sat": 
+          continue
+
+        # append stack if within limits
+        if n < max_depth:
+          stack.append((pc, state_, path_, n + 1))
+
+  return f"all is fine, uptil depth {max_depth}"
+
 
 def analyse():
-    """The dynamic analysis, e.g. in this case a (dumb) fuzzer."""
+    """The concolic analysis, e.g. in this case a (dumb) fuzzer."""
 
     methodid = jpamb.getmethodid(
         "dynamic",
@@ -415,15 +449,17 @@ def analyse():
     randomTries = 50
     for i in range(randomTries):
         input = fuzz_input(rand, methodid)
-        state = initial(bc, methodid, input)
+        
 
-        for x in range(MAX_STEPS):
-            _, state = step(bc, state)
-            if isinstance(state, str):
-                behaviors.add(state)
-                break
-            elif x == MAX_STEPS - 1:
-                behaviors.add("*")
+        # state = initial(bc, methodid, input)
+
+        # for x in range(MAX_STEPS):
+        #     _, state = step(bc, state)
+        #     if isinstance(state, str):
+        #         behaviors.add(state)
+        #         break
+        #     elif x == MAX_STEPS - 1:
+        #         behaviors.add("*")
 
     for query in jpamb.QUERIES:
         if query in behaviors:
