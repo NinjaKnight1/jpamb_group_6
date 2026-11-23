@@ -1,6 +1,8 @@
 import random
 import sys
 
+import jpamb.case
+
 import jpamb
 import jvm
 import jvm.state as jvmc
@@ -53,6 +55,7 @@ def step(bc: jpamb.Bytecode, state: jvmc.State) -> tuple[jvmc.PC, jvmc.State | s
     match opr:
         case jvm.Push(type=t, value=v):
             if t is jvm.Int():
+                assert isinstance(v, int), f"expected int, but got {v}"
                 frame.stack.push(jvmc.StackInt(v))
             elif t is jvm.Reference():
                 assert isinstance(v, int), f"expected int, but got {v}"
@@ -361,6 +364,9 @@ def interpret():
     suite, eff = jpamb.setup()
     bc = jpamb.Bytecode(suite, eff, {})
 
+    if input is None:
+        raise ValueError()
+
     state = initial(bc, methodid, input)
 
     last = jpamb.emit_init(state)
@@ -387,33 +393,38 @@ def fuzz_input(rand: random.Random, methodid: jvm.AbsMethodID) -> jpamb.case.Inp
                     "Don't know how to create random values for {input}"
                 )
 
-    return jpamb.case.Input(input)
+    return jpamb.case.Input(tuple(input))
 
-def concolicAnalyse(pc : jvmc.PC, inputs : list[tuple[str, jvm.Type]], max_depth : int):
+def interesting(state: SymState)-> bool:
+    return False
+
+def concolicAnalyse(bc : jpamb.Bytecode, pc : jvmc.PC, inputs : list[tuple[str, jvm.Type]], max_depth : int):
   # assuming only integers, create symbolic vars for all input
   locals = z3.Ints(" ".join(i_name for i_name, _ in inputs))
   # create state.
   state = SymState.from_locals(locals)
 
   # Create a stack to do depth first search with.
-  stack : list[tuple[jvmc.PC, SymState, SymPath, int]] = [(pc, state, [],0)]
+  stack : list[tuple[jvmc.PC, SymState, SymPath, int]] = [(pc, state, [], 0)]
 
   # As long as the stack is not empty
   while stack:
     # pop the end of the stack
-    (pc, state, path, n) = stack.pop(-1)
+    (pc, state, path, n) = stack.pop()
 
     # Check if state does something we want to warn the user about.
     if interesting(state):
       return "found interesting state"
 
     # otherwise create the list of next branches 
-    for (pc, state_, pathc) in step(pc, state):
+    for (pc, state_, pathc) in step(bc, state):
         # add new path constraints to the path
         path_ = path + pathc
 
+        solver = z3.Solver()
+        solver.add(*path_)
         # check if path is reachable
-        if str(z3.check(path_)) != "sat": 
+        if solver.check() != z3.unsat: 
           continue
 
         # append stack if within limits
@@ -421,7 +432,6 @@ def concolicAnalyse(pc : jvmc.PC, inputs : list[tuple[str, jvm.Type]], max_depth
           stack.append((pc, state_, path_, n + 1))
 
   return f"all is fine, uptil depth {max_depth}"
-
 
 def analyse():
     """The concolic analysis, e.g. in this case a (dumb) fuzzer."""
