@@ -5,6 +5,8 @@ import jpamb
 import jvm
 import jvm.state as jvmc
 
+TRACE = False
+
 def binary(op, v1: int, v2: int) -> int | str:
     match op:
         case jvm.BinaryOpr.Div:
@@ -48,7 +50,8 @@ def step(bc: jpamb.Bytecode, state: jvmc.State) -> tuple[jvmc.PC, jvmc.State | s
     pc = frame.pc
     opr = bc[pc]
     output = state
-    print(f"Stepping {pc}:\n > {opr}", file=sys.stderr)
+    if TRACE:
+        print(f"Stepping {pc}:\n > {opr}", file=sys.stderr)
     match opr:
         case jvm.Push(type=t, value=v):
             if t is jvm.Int():
@@ -388,31 +391,154 @@ def fuzz_input(rand: random.Random, methodid: jvm.AbsMethodID) -> jpamb.case.Inp
 
     return jpamb.case.Input(input)
 
-## TODO 
 class Corpus:
-  parameters: jpamb.Parameters
-  interesting: list[bytes]
-  coverage: set[jvmc.PC]
- 
-  def byte_fuzz(self, code: bytes) -> jpamb.case.Input:
-      """Using an sequence of bytes, create a new input which matches 
-      the parameters"""
+    """A small deterministic corpus for coverage-guided input mutation."""
 
-  def next(self) -> jpamb.case.Input:
-      """Randomly pick an intersting case, and mutate by making changes to the bytes"""
+    MAX_SEQUENCE_LENGTH = 16
 
-  def add(self, input: jpamb.case.Input, coverage: set[jvmc.PC]):
-      """Add the input to the interesting cases if increases coverage"""
+    def __init__(self, parameters: jvm.Parameters, rand: random.Random):
+        self.parameters = parameters
+        self.rand = rand
+        self.interesting: list[bytes] = []
+        self.coverage: set[jvmc.PC] = set()
+
+    def _size(self, type: jvm.Type) -> int:
+        if isinstance(type, (jvm.Int, jvm.Float)):
+            return 4
+        if isinstance(type, (jvm.Boolean, jvm.Char)):
+            return 2
+        if isinstance(type, jvm.Array) or (
+            isinstance(type, jvm.Object)
+            and type.name == jvm.ClassName("java.lang.String")
+        ):
+            return 1 + self.MAX_SEQUENCE_LENGTH * 4
+        raise NotImplementedError(f"Cannot fuzz values of type {type}")
+
+    def _buffer_size(self) -> int:
+        return sum(self._size(type) for type in self.parameters)
+
+    def byte_fuzz(self, code: bytes) -> jpamb.case.Input:
+        """Decode a fixed-size mutation buffer into a valid JVM input."""
+        code = code.ljust(self._buffer_size(), b"\x00")
+        offset = 0
+        values = []
+
+        for type in self.parameters:
+            if isinstance(type, jvm.Int):
+                values.append(jpamb.case.Int(int.from_bytes(
+                    code[offset:offset + 4], "big", signed=True
+                )))
+                offset += 4
+            elif isinstance(type, jvm.Boolean):
+                values.append(jpamb.case.Boolean(code[offset] % 2 == 1))
+                offset += 2
+            elif isinstance(type, jvm.Char):
+                values.append(jpamb.case.Char(chr(int.from_bytes(
+                    code[offset:offset + 2], "big"
+                ) % 0x10000)))
+                offset += 2
+            elif isinstance(type, jvm.Object) and type.name == jvm.ClassName("java.lang.String"):
+                length = code[offset] % (self.MAX_SEQUENCE_LENGTH + 1)
+                offset += 1
+                value = bytes(code[offset:offset + 4 * self.MAX_SEQUENCE_LENGTH:4])
+                values.append(jpamb.case.String(value[:length].decode("latin1")))
+                offset += 4 * self.MAX_SEQUENCE_LENGTH
+            elif isinstance(type, jvm.Array) and isinstance(type.contains, (jvm.Int, jvm.Char)):
+                length = code[offset] % (self.MAX_SEQUENCE_LENGTH + 1)
+                offset += 1
+                raw_values = []
+                for _ in range(self.MAX_SEQUENCE_LENGTH):
+                    raw = int.from_bytes(code[offset:offset + 4], "big", signed=True)
+                    offset += 4
+                    raw_values.append(raw)
+                if isinstance(type.contains, jvm.Char):
+                    raw_values = [chr(value % 0x10000) for value in raw_values]
+                values.append(jpamb.case.Array(type.contains, tuple(raw_values[:length])))
+            else:
+                raise NotImplementedError(f"Cannot fuzz values of type {type}")
+
+        return jpamb.case.Input(tuple(values))
+
+    def _seed(self) -> bytes:
+        return bytes(self._buffer_size())
+
+    def next(self) -> jpamb.case.Input:
+        """Mutate a retained seed and decode it into a valid input."""
+        source = self.rand.choice(self.interesting) if self.interesting else self._seed()
+        mutation = bytearray(source)
+        if not mutation:
+            return self.byte_fuzz(bytes(mutation))
+        changes = max(1, self.rand.randint(1, min(4, len(mutation))))
+        for _ in range(changes):
+            mutation[self.rand.randrange(len(mutation))] = self.rand.randrange(256)
+        return self.byte_fuzz(bytes(mutation))
+
+    def add(self, input: jpamb.case.Input, coverage: set[jvmc.PC]) -> bool:
+        """Retain an input when it expands the corpus coverage."""
+        new_coverage = coverage - self.coverage
+        if not new_coverage:
+            return False
+        self.coverage.update(new_coverage)
+        self.interesting.append(self._encode(input))
+        return True
+
+    def _encode(self, input: jpamb.case.Input) -> bytes:
+        """Encode an input into the fixed-width representation used by mutations."""
+        encoded = bytearray(self._buffer_size())
+        offset = 0
+        for type, value in zip(self.parameters, input.values):
+            if isinstance(type, jvm.Int):
+                encoded[offset:offset + 4] = value.value.to_bytes(4, "big", signed=True)
+                offset += 4
+            elif isinstance(type, jvm.Boolean):
+                encoded[offset] = int(value.value)
+                offset += 2
+            elif isinstance(type, jvm.Char):
+                encoded[offset:offset + 2] = ord(value.value).to_bytes(2, "big")
+                offset += 2
+            elif isinstance(type, jvm.Object):
+                raw = value.value.encode("latin1")[:self.MAX_SEQUENCE_LENGTH]
+                encoded[offset] = len(raw)
+                offset += 1
+                for char in raw:
+                    encoded[offset] = char
+                    offset += 4
+                offset += 4 * (self.MAX_SEQUENCE_LENGTH - len(raw))
+            elif isinstance(type, jvm.Array):
+                encoded[offset] = min(len(value.values), self.MAX_SEQUENCE_LENGTH)
+                offset += 1
+                for item in value.values[:self.MAX_SEQUENCE_LENGTH]:
+                    number = ord(item) if isinstance(type.contains, jvm.Char) else item
+                    encoded[offset:offset + 4] = number.to_bytes(4, "big", signed=True)
+                    offset += 4
+                offset += 4 * (self.MAX_SEQUENCE_LENGTH - len(value.values))
+        return bytes(encoded)
+
+
+def execute(
+    bc: jpamb.Bytecode,
+    methodid: jvm.AbsMethodID,
+    input: jpamb.case.Input,
+    max_steps: int,
+) -> tuple[set[jvmc.PC], str]:
+    state = initial(bc, methodid, input)
+    coverage = set()
+    for _ in range(max_steps):
+        pc, state = step(bc, state)
+        coverage.add(pc)
+        if isinstance(state, str):
+            return coverage, state
+    return coverage, "*"
 
 
 def analyse():
-    """The dynamic analysis, e.g. in this case a (dumb) fuzzer."""
+    """Run a deterministic coverage-guided fuzzing analysis."""
 
     methodid = jpamb.getmethodid(
-        "dynamic",
+        "coverage",
         "1.0",
-        "Dynamo",
-        ["dynamic", "python"],
+        "Coverage",
+        ["coverage-based", "python"],
         for_science=True,
     )
 
@@ -420,25 +546,21 @@ def analyse():
     bc = jpamb.Bytecode(suite, eff, {})
 
     MAX_STEPS = 10000
-
-    import random
-
-    # Make the randomness deterministic
+    MAX_INPUTS = 200
     rand = random.Random(0)
+    corpus = Corpus(methodid.extension.params, rand)
 
     behaviors = set()
-    # Try 10 random inputs
-    for i in range(50):
-        input = fuzz_input(rand, methodid)
-        state = initial(bc, methodid, input)
+    input = corpus.byte_fuzz(bytes(corpus._buffer_size()))
+    coverage, behavior = execute(bc, methodid, input, MAX_STEPS)
+    corpus.add(input, coverage)
+    behaviors.add(behavior)
 
-        for x in range(MAX_STEPS):
-            _, state = step(bc, state)
-            if isinstance(state, str):
-                behaviors.add(state)
-                break
-            elif x == MAX_STEPS - 1:
-                behaviors.add("*")
+    for _ in range(MAX_INPUTS - 1):
+        input = corpus.next()
+        coverage, behavior = execute(bc, methodid, input, MAX_STEPS)
+        corpus.add(input, coverage)
+        behaviors.add(behavior)
 
     for query in jpamb.QUERIES:
         if query in behaviors:
