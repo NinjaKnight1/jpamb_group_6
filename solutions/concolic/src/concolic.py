@@ -1,5 +1,6 @@
 import random
 import sys
+from dataclasses import dataclass
 
 import jpamb
 import jvm
@@ -389,43 +390,280 @@ def fuzz_input(rand: random.Random, methodid: jvm.AbsMethodID) -> jpamb.case.Inp
 
     return jpamb.case.Input(input)
 
-def concolicAnalyse(pc : jvmc.PC, inputs : list[tuple[str, jvm.Type]], max_depth : int):
-  # assuming only integers, create symbolic vars for all input
-  locals = z3.Ints(" ".join(i_name for i_name, _ in inputs))
-  # create state.
-  state = SymState.from_locals(locals)
+SymValue = z3.ArithRef
+SymPath = tuple[z3.BoolRef, ...]
 
-  # Create a stack to do depth first search with.
-  stack : list[tuple[jvmc.PC, SymState, SymPath, int]] = [(pc, state, [],0)]
 
-  # As long as the stack is not empty
-  while stack:
-    # pop the end of the stack
-    (pc, state, path, n) = stack.pop(-1)
+@dataclass
+class SymFrame:
+    method: jvm.AbsMethodID
+    pc: jvmc.PC
+    locals: list[SymValue | None]
+    stack: list[SymValue]
 
-    # Check if state does something we want to warn the user about.
-    if interesting(state):
-      return "found interesting state"
+    def clone(self) -> "SymFrame":
+        return SymFrame(self.method, self.pc, self.locals.copy(), self.stack.copy())
 
-    # otherwise create the list of next branches 
-    for (pc, state_, pathc) in step(pc, state):
-        # add new path constraints to the path
-        path_ = path + pathc
 
-        # check if path is reachable
-        if str(z3.check(path_)) != "sat": 
-          continue
+@dataclass
+class SymState:
+    frames: list[SymFrame]
+    result: str | None = None
 
-        # append stack if within limits
-        if n < max_depth:
-          stack.append((pc, state_, path_, n + 1))
+    @classmethod
+    def from_locals(
+        cls,
+        bc: jpamb.Bytecode,
+        methodid: jvm.AbsMethodID,
+        locals: list[SymValue],
+    ) -> "SymState":
+        method = bc.getmethod(methodid)
+        if len(locals) > method.max_locals:
+            raise ValueError("More symbolic inputs than method local variables")
+        frame_locals: list[SymValue | None] = [None] * method.max_locals
+        frame_locals[: len(locals)] = locals
+        frame = SymFrame(methodid, jvmc.PC(methodid, 0), frame_locals, [])
+        return cls([frame])
 
-  return f"all is fine, uptil depth {max_depth}"
+    @property
+    def frame(self) -> SymFrame:
+        return self.frames[-1]
+
+    def clone(self) -> "SymState":
+        return SymState([frame.clone() for frame in self.frames], self.result)
+
+
+def interesting(state: SymState) -> bool:
+    """A completed JVM behavior is an outcome worth reporting."""
+    return state.result is not None
+
+
+def _wrap_int(value: SymValue) -> SymValue:
+    """Wrap an integer expression to the JVM's signed 32-bit range."""
+    return (value + (1 << 31)) % (1 << 32) - (1 << 31)
+
+
+def _java_divide(left: SymValue, right: SymValue) -> SymValue:
+    left_abs = z3.If(left >= 0, left, -left)
+    right_abs = z3.If(right >= 0, right, -right)
+    quotient = left_abs / right_abs
+    return z3.If((left < 0) != (right < 0), -quotient, quotient)
+
+
+def _symbolic_compare(
+    condition: jvm.CmpOpr, left: SymValue, right: SymValue
+) -> z3.BoolRef:
+    match condition:
+        case jvm.CmpOpr.Eq:
+            return left == right
+        case jvm.CmpOpr.Ne:
+            return left != right
+        case jvm.CmpOpr.Gt:
+            return left > right
+        case jvm.CmpOpr.Ge:
+            return left >= right
+        case jvm.CmpOpr.Lt:
+            return left < right
+        case jvm.CmpOpr.Le:
+            return left <= right
+        case _:
+            raise NotImplementedError(f"Unhandled comparison {condition!r}")
+
+
+def _satisfiable(path: SymPath) -> bool:
+    solver = z3.Solver()
+    solver.add(*path)
+    result = solver.check()
+    if result == z3.unknown:
+        raise RuntimeError(f"Z3 could not decide path reachability: {solver.reason_unknown()}")
+    return result == z3.sat
+
+
+def _symbolic_step(
+    bc: jpamb.Bytecode, state: SymState, path: SymPath
+) -> list[tuple[SymState, SymPath]]:
+    frame = state.frame
+    pc = frame.pc
+    opr = bc[pc]
+
+    def pop() -> SymValue:
+        if not frame.stack:
+            raise IndexError(f"Operand stack underflow at {pc}")
+        return frame.stack.pop()
+
+    def advance() -> None:
+        frame.pc += 1
+
+    match opr:
+        case jvm.Push(type=jvm.Int(), value=value):
+            assert isinstance(value, int)
+            frame.stack.append(z3.IntVal(value))
+            advance()
+        case jvm.Binary(type=jvm.Int(), operant=operation):
+            right, left = pop(), pop()
+            if operation in (jvm.BinaryOpr.Div, jvm.BinaryOpr.Rem):
+                zero = right == 0
+                error = state.clone()
+                error.result = "divide by zero"
+                normal = state.clone()
+                normal.frame.stack.append(
+                    _wrap_int(
+                        _java_divide(left, right)
+                        if operation == jvm.BinaryOpr.Div
+                        else left - _java_divide(left, right) * right
+                    )
+                )
+                normal.frame.pc += 1
+                return [
+                    (error, path + (zero,)),
+                    (normal, path + (z3.Not(zero),)),
+                ]
+
+            match operation:
+                case jvm.BinaryOpr.Add:
+                    value = left + right
+                case jvm.BinaryOpr.Sub:
+                    value = left - right
+                case jvm.BinaryOpr.Mul:
+                    value = left * right
+                case _:
+                    raise NotImplementedError(f"Unhandled binary operation {operation!r}")
+            frame.stack.append(_wrap_int(value))
+            advance()
+        case jvm.Ifz(condition=condition, target=target):
+            value = pop()
+            predicate = _symbolic_compare(condition, value, z3.IntVal(0))
+            taken, fallthrough = state.clone(), state.clone()
+            taken.frame.pc %= target
+            fallthrough.frame.pc += 1
+            return [
+                (taken, path + (predicate,)),
+                (fallthrough, path + (z3.Not(predicate),)),
+            ]
+        case jvm.If(condition=condition, target=target):
+            right, left = pop(), pop()
+            predicate = _symbolic_compare(condition, left, right)
+            taken, fallthrough = state.clone(), state.clone()
+            taken.frame.pc %= target
+            fallthrough.frame.pc += 1
+            return [
+                (taken, path + (predicate,)),
+                (fallthrough, path + (z3.Not(predicate),)),
+            ]
+        case jvm.Load(type=jvm.Int(), index=index):
+            value = frame.locals[index]
+            if value is None:
+                raise IndexError(f"Read of uninitialized local {index} at {pc}")
+            frame.stack.append(value)
+            advance()
+        case jvm.Store(type=jvm.Int(), index=index):
+            frame.locals[index] = pop()
+            advance()
+        case jvm.Incr(index=index, amount=amount):
+            value = frame.locals[index]
+            if value is None:
+                raise IndexError(f"Read of uninitialized local {index} at {pc}")
+            frame.locals[index] = _wrap_int(value + amount)
+            advance()
+        case jvm.Dup(words=1):
+            value = pop()
+            frame.stack.extend((value, value))
+            advance()
+        case jvm.Goto(target=target):
+            frame.pc %= target
+        case jvm.Cast(from_=jvm.Int(), to_=jvm.Short()):
+            frame.stack.append(pop() % (1 << 16))
+            advance()
+        case jvm.Negate(type=jvm.Int()):
+            frame.stack.append(_wrap_int(-pop()))
+            advance()
+        case jvm.Get(static=True, field=field):
+            if field.extension.name != "$assertionsDisabled":
+                raise NotImplementedError(f"Unhandled static field {field}")
+            frame.stack.append(z3.IntVal(0))
+            advance()
+        case jvm.New(classname=jvm.ClassName("java.lang.AssertionError")):
+            state.result = "assertion error"
+        case jvm.Return(type=return_type):
+            value = pop() if isinstance(return_type, jvm.Int) else None
+            state.frames.pop()
+            if not state.frames:
+                state.result = "ok"
+            else:
+                caller = state.frame
+                if value is not None:
+                    caller.stack.append(value)
+                caller.pc += 1
+        case jvm.InvokeStatic(method=methodid):
+            callee_method = bc.getmethod(methodid)
+            parameter_count = len(methodid.extension.params)
+            arguments = [pop() for _ in range(parameter_count)]
+            arguments.reverse()
+            if parameter_count > callee_method.max_locals:
+                raise ValueError(f"Too many arguments for {methodid}")
+            callee_locals: list[SymValue | None] = [None] * callee_method.max_locals
+            callee_locals[:parameter_count] = arguments
+            state.frames.append(
+                SymFrame(methodid, jvmc.PC(methodid, 0), callee_locals, [])
+            )
+        case _:
+            raise NotImplementedError(
+                f"Symbolic execution does not support {opr!r} at {pc}"
+            )
+
+    return [(state, path)]
+
+
+def concolicAnalyse(
+    bc: jpamb.Bytecode,
+    methodid: jvm.AbsMethodID,
+    inputs: list[tuple[str, jvm.Type]],
+    max_depth: int,
+) -> set[str]:
+    """Explore feasible integer-input paths up to ``max_depth`` instructions."""
+    if max_depth < 0:
+        raise ValueError("max_depth must be non-negative")
+
+    symbolic_inputs: list[SymValue] = []
+    initial_path: SymPath = ()
+    for index, (name, input_type) in enumerate(inputs):
+        if isinstance(input_type, jvm.Int):
+            value = z3.Int(f"{name}_{index}")
+            initial_path += (value >= -(1 << 31), value < (1 << 31))
+        elif isinstance(input_type, jvm.Boolean):
+            value = z3.Int(f"{name}_{index}")
+            initial_path += (value >= 0, value <= 1)
+        else:
+            raise NotImplementedError(
+                f"Symbolic inputs of type {input_type} are not supported"
+            )
+        symbolic_inputs.append(value)
+
+    initial_state = SymState.from_locals(bc, methodid, symbolic_inputs)
+    worklist: list[tuple[SymState, SymPath, int]] = [
+        (initial_state, initial_path, 0)
+    ]
+    behaviors: set[str] = set()
+
+    while worklist:
+        state, path, depth = worklist.pop()
+        if interesting(state):
+            assert state.result is not None
+            behaviors.add(state.result)
+            continue
+        if depth >= max_depth:
+            behaviors.add("*")
+            continue
+
+        for next_state, next_path in _symbolic_step(bc, state, path):
+            if _satisfiable(next_path):
+                worklist.append((next_state, next_path, depth + 1))
+
+    return behaviors
 
 
 def analyse():
     """The concolic analysis, e.g. in this case a (dumb) fuzzer."""
-
     methodid = jpamb.getmethodid(
         "dynamic",
         "1.0",
@@ -433,63 +671,51 @@ def analyse():
         ["dynamic", "python"],
         for_science=True,
     )
-
     suite, eff = jpamb.setup()
     bc = jpamb.Bytecode(suite, eff, {})
 
     MAX_STEPS = 10000
-
-    import random
-
-    # Make the randomness deterministic
-    rand = random.Random(0)
-
     behaviors = set()
-    # Try random inputs
-    randomTries = 50
-    for i in range(randomTries):
-        input = fuzz_input(rand, methodid)
-        
+    inputs = [
+        (f"arg{index}", input_type)
+        for index, input_type in enumerate(methodid.extension.params)
+    ]
+    behaviors.update(concolicAnalyse(bc, methodid, inputs, MAX_STEPS))
 
-        # state = initial(bc, methodid, input)
+    # print answers
+    printAnswer(behaviors)
 
-        # for x in range(MAX_STEPS):
-        #     _, state = step(bc, state)
-        #     if isinstance(state, str):
-        #         behaviors.add(state)
-        #         break
-        #     elif x == MAX_STEPS - 1:
-        #         behaviors.add("*")
 
+def printAnswer(behaviors: set[str]):
     for query in jpamb.QUERIES:
-        if query in behaviors:
-            if query == "*":
-                print(f"{query};timeout")
-            elif query == "assertion error":
-                print(f"{query};assertion-error-found")
-            elif query == "divide by zero":
-                print(f"{query};divide-by-zero-found")
-            elif query == "null pointer":
-                print(f"{query};null-pointer-found")
-            elif query == "ok":
-                print(f"{query};ok")
-            elif query == "out of bounds":
-                print(f"{query};out-of-bounds-found")
+            if query in behaviors:
+                if query == "*":
+                    print(f"{query};timeout")
+                elif query == "assertion error":
+                    print(f"{query};assertion-error-found")
+                elif query == "divide by zero":
+                    print(f"{query};divide-by-zero-found")
+                elif query == "null pointer":
+                    print(f"{query};null-pointer-found")
+                elif query == "ok":
+                    print(f"{query};ok")
+                elif query == "out of bounds":
+                    print(f"{query};out-of-bounds-found")
+                else:
+                    print(f"{query};found")
             else:
-                print(f"{query};found")
-        else:
-            if query == "*":
-                print(f"{query};no-timeout")
-            elif query == "assertion error":
-                print(f"{query};no-assertion-error")
-            elif query == "divide by zero":
-                print(f"{query};no-divide-by-zero")
-            elif query == "null pointer":
-                print(f"{query};no-null-pointer")
-            elif query == "ok":
-                print(f"{query};no-ok")
-            elif query == "out of bounds":
-                print(f"{query};no-out-of-bounds")
-            else:
-                print(f"{query};found")
+                if query == "*":
+                    print(f"{query};no-timeout")
+                elif query == "assertion error":
+                    print(f"{query};no-assertion-error")
+                elif query == "divide by zero":
+                    print(f"{query};no-divide-by-zero")
+                elif query == "null pointer":
+                    print(f"{query};no-null-pointer")
+                elif query == "ok":
+                    print(f"{query};no-ok")
+                elif query == "out of bounds":
+                    print(f"{query};no-out-of-bounds")
+                else:
+                    print(f"{query};found")
 
