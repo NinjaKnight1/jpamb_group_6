@@ -594,3 +594,11 @@ def analyse():
             else:
                 print(f"{query};found")
 
+## TODO:
+## add/remove bytes from prameters
+## change how bytes are changed
+## when are interesting bytes added to the list
+## what should happen if there are no more interesting bytes
+## 
+## add more tests
+
