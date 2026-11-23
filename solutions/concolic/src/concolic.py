@@ -373,23 +373,6 @@ def interpret():
         if isinstance(state, str):
             break
 
-
-def fuzz_input(rand: random.Random, methodid: jvm.AbsMethodID) -> jpamb.case.Input:
-    input = []
-    # 1. come up with possible inputs
-    for p in methodid.extension.params:
-        match p:
-            case jvm.Int():
-                input.append(jpamb.case.Int(rand.randint(-(1 << 31), 1 << 31)))
-            case jvm.Boolean():
-                input.append(jpamb.case.Boolean(1 == rand.randint(0, 1)))
-            case a:
-                raise NotImplementedError(
-                    "Don't know how to create random values for {input}"
-                )
-
-    return jpamb.case.Input(input)
-
 SymValue = z3.ArithRef
 SymPath = tuple[z3.BoolRef, ...]
 
@@ -606,7 +589,7 @@ def _symbolic_step(
             state.frames.append(
                 SymFrame(methodid, jvmc.PC(methodid, 0), callee_locals, [])
             )
-        case _:
+        case _: # TODO Handle strings and arrays
             raise NotImplementedError(
                 f"Symbolic execution does not support {opr!r} at {pc}"
             )
@@ -634,17 +617,19 @@ def concolicAnalyse(
             value = z3.Int(f"{name}_{index}")
             initial_path += (value >= 0, value <= 1)
         else:
+            # TODO Arrays and strings
             raise NotImplementedError(
                 f"Symbolic inputs of type {input_type} are not supported"
             )
         symbolic_inputs.append(value)
 
     initial_state = SymState.from_locals(bc, methodid, symbolic_inputs)
+    # TODO add program counter to find infinite loops
     worklist: list[tuple[SymState, SymPath, int]] = [
         (initial_state, initial_path, 0)
     ]
     behaviors: set[str] = set()
-
+    # TODO combine symbolic and concrete somehow
     while worklist:
         state, path, depth = worklist.pop()
         if interesting(state):
